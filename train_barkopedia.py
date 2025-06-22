@@ -3,6 +3,8 @@ import os
 from datasets import load_dataset, load_from_disk
 from transformers import ASTFeatureExtractor, ASTForAudioClassification, TrainingArguments, Trainer
 import torch
+from sklearn.metrics import accuracy_score
+import numpy as np
 
 # Load Hugging Face token from hf_token.py if available
 hf_token_path = os.path.join(os.path.dirname(__file__), 'hf_token.py')
@@ -54,7 +56,7 @@ model = ASTForAudioClassification.from_pretrained(
 )
 
 # Set which GPU to use
-GPU_NUM = 1  # Change this to the desired GPU index
+GPU_NUM = 2 # Change this to the desired GPU index
 os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_NUM)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -96,19 +98,34 @@ training_args = TrainingArguments(
     eval_strategy="epoch",
     save_strategy="epoch",
     learning_rate=2e-5,
-    per_device_train_batch_size=4,
-    per_device_eval_batch_size=4,
+    per_device_train_batch_size=32,
+    per_device_eval_batch_size=32,
     num_train_epochs=3,
     weight_decay=0.01,
     logging_dir="./logs",
     logging_steps=10,
+    dataloader_num_workers=4,
 )
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=1)
+    acc = accuracy_score(labels, preds)
+    return {"accuracy": acc}
 
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_ds,
     eval_dataset=test_ds if test_ds else None,
+    compute_metrics=compute_metrics,
 )
 
 trainer.train()
+
+# Save the fine-tuned model and feature extractor
+save_dir = "./barkopedia_finetuned_model"
+print(f"Saving model and feature extractor to {save_dir} ...")
+model.save_pretrained(save_dir)
+feature_extractor.save_pretrained(save_dir)
+print("Model and feature extractor saved.")
