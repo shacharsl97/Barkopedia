@@ -1,10 +1,14 @@
 # Fine-tune MIT/ast-finetuned-audioset-10-10-0.4593 on Barkopedia
 import os
 from datasets import load_dataset, load_from_disk
-from transformers import ASTFeatureExtractor, ASTForAudioClassification, TrainingArguments, Trainer
+from transformers import ASTFeatureExtractor, ASTForAudioClassification, ASTConfig, TrainingArguments, Trainer
 import torch
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score
 import numpy as np
+
+# Set which GPU to use
+GPU_NUM = 1 # Change this to the desired GPU index
+os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_NUM)
 
 # Load Hugging Face token from hf_token.py if available
 hf_token_path = os.path.join(os.path.dirname(__file__), 'hf_token.py')
@@ -49,15 +53,19 @@ feature_extractor = ASTFeatureExtractor.from_pretrained(
 # Get number of unique labels
 num_labels = len(set(train_ds["label"]))
 
-model = ASTForAudioClassification.from_pretrained(
+# Set dropout rate in config
+config = ASTConfig.from_pretrained(
     "MIT/ast-finetuned-audioset-10-10-0.4593",
     num_labels=num_labels,
-    ignore_mismatched_sizes=True
+    hidden_dropout_prob=0.15,  # Increase dropout (default is usually 0.1)
+    attention_probs_dropout_prob=0.15
 )
 
-# Set which GPU to use
-GPU_NUM = 2 # Change this to the desired GPU index
-os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_NUM)
+model = ASTForAudioClassification.from_pretrained(
+    "MIT/ast-finetuned-audioset-10-10-0.4593",
+    config=config,
+    ignore_mismatched_sizes=True
+)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
@@ -101,7 +109,7 @@ training_args = TrainingArguments(
     per_device_train_batch_size=32,
     per_device_eval_batch_size=32,
     num_train_epochs=3,
-    weight_decay=0.01,
+    weight_decay=0.05,  # Increase weight decay
     logging_dir="./logs",
     logging_steps=10,
     dataloader_num_workers=4,
@@ -111,7 +119,8 @@ def compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=1)
     acc = accuracy_score(labels, preds)
-    return {"accuracy": acc}
+    f1 = f1_score(labels, preds, average='weighted')
+    return {"accuracy": acc, "f1": f1}
 
 trainer = Trainer(
     model=model,

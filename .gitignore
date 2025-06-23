@@ -4,3 +4,5 @@ __pycache__
 barkopedia_dataset/
 test_preprocessed/
 train_preprocessed/
+results/
+barkopedia_finetuned_model/
