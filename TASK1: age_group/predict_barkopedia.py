@@ -5,8 +5,8 @@ from datasets import load_dataset, load_from_disk
 from transformers import ASTFeatureExtractor, ASTForAudioClassification
 
 # Set device
-GPU_NUM = 2  # Change if needed
-os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_NUM)
+# GPU_NUM = 2  # Change if needed
+# os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_NUM)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Load model and feature extractor
