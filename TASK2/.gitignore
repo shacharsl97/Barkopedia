@@ -1,0 +1,11 @@
+# Ignore Hugging Face token file
+hf_token.py
+__pycache__
+barkopedia_dataset/
+test_preprocessed/
+train_preprocessed/
+test_preprocessed_aug/
+train_preprocessed_aug/
+results/
+barkopedia_finetuned_model/
+augmented_train/

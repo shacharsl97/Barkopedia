@@ -1,4 +1,4 @@
-# Fine-tune MIT/ast-finetuned-audioset-10-10-0.4593 on Barkopedia
+# Fine-tune audio backbone models on Barkopedia Dog Sex Classification
 import os
 from datasets import load_dataset, load_from_disk, concatenate_datasets
 from transformers import TrainingArguments, Trainer
@@ -10,9 +10,9 @@ import pandas as pd
 from datasets import Dataset, Features, Sequence, Value
 import json
 
-# Age order and distance matrix
-age_order = {4: 0, 3: 1, 0: 2, 2: 3, 1: 4}
-n_classes = 5
+# Age order and distance matrix (not used for sex, but kept for compatibility)
+age_order = {0: 0, 1: 1}
+n_classes = 2
 distance_matrix = torch.zeros((n_classes, n_classes))
 for i in range(n_classes):
     for j in range(n_classes):
@@ -29,7 +29,6 @@ def soft_cross_entropy_with_distance(logits, true_labels, distance_matrix, tempe
     loss = torch.sum(-soft_targets * log_probs, dim=1)  # [B]
     return torch.mean(loss)
 
-# {'learning_rate': 1.5e-05, 'weight_decay': 0.02, 'hidden_dropout_prob': 0.3, 'attention_probs_dropout_prob': 0.3, 'data_mode': 'original'}
 parser = argparse.ArgumentParser()
 parser.add_argument('--learning_rate', type=float, default=1.5e-05)
 parser.add_argument('--weight_decay', type=float, default=0.02)
@@ -58,11 +57,11 @@ if os.path.exists(hf_token_path):
 else:
     HF_TOKEN = os.environ.get("HF_TOKEN")
 
-# Load dataset
+# Load dataset (Dog Sex Classification)
 local_dir = "./barkopedia_dataset"
 print("Loading dataset from Hugging Face Hub...")
 ds = load_dataset(
-    "ArlingtonCL2/Barkopedia_DOG_AGE_GROUP_CLASSIFICATION_DATASET",
+    "ArlingtonCL2/Barkopedia_Dog_Sex_Classification_Dataset",
     token=HF_TOKEN,
     cache_dir=local_dir,
 )
@@ -74,15 +73,12 @@ train_ds = ds[splits[0]]
 test_ds = ds[splits[1]]
 print(f"Initial train_ds: {len(train_ds)} samples")
 print(f"Initial test_ds: {len(test_ds)} samples")
-# print available splits and their sizes
 print("Available splits:", ds.keys())
 for split in ds.keys():
     print(f"{split}: {len(ds[split])} samples")
 
-# print columns and labels
 print("Columns in train dataset:", train_ds.column_names)
 print("Labels:", set(train_ds["label"]))
-
 
 # Determine number of classes dynamically from dataset
 class_names = sorted(list(set([item['label'] for item in train_ds])))
@@ -93,21 +89,23 @@ print("Number of labels:", num_labels)
 # Load feature extractor and model based on backbone
 if args.backbone == 'ast':
     from transformers import ASTFeatureExtractor, ASTForAudioClassification, ASTConfig
-    model_name = "MIT/ast-finetuned-audioset-10-10-0.4593"
-    feature_extractor = ASTFeatureExtractor.from_pretrained(model_name)
+    feature_extractor = ASTFeatureExtractor.from_pretrained(
+        "MIT/ast-finetuned-audioset-10-10-0.4593"
+    )
     config = ASTConfig.from_pretrained(
-        model_name,
+        "MIT/ast-finetuned-audioset-10-10-0.4593",
         num_labels=num_labels,
         hidden_dropout_prob=args.hidden_dropout_prob,
         attention_probs_dropout_prob=args.attention_probs_dropout_prob
     )
     ModelClass = ASTForAudioClassification
 elif args.backbone == 'beats':
-    from transformers import BEATSFeatureExtractor, BEATSForAudioClassification, BEATSConfig
-    model_name = "microsoft/beats-finetuned-audioset-epoch-16"
-    feature_extractor = BEATSFeatureExtractor.from_pretrained(model_name)
+    from transformers.models import BEATSFeatureExtractor, BEATSForAudioClassification, BEATSConfig
+    feature_extractor = BEATSFeatureExtractor.from_pretrained(
+        "microsoft/beats-finetuned-audioset-epoch-16"
+    )
     config = BEATSConfig.from_pretrained(
-        model_name,
+        "microsoft/beats-finetuned-audioset-epoch-16",
         num_labels=num_labels,
         hidden_dropout_prob=args.hidden_dropout_prob,
         attention_probs_dropout_prob=args.attention_probs_dropout_prob
@@ -115,10 +113,11 @@ elif args.backbone == 'beats':
     ModelClass = BEATSForAudioClassification
 elif args.backbone == 'wav2vec2':
     from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForSequenceClassification, Wav2Vec2Config
-    model_name = "facebook/wav2vec2-base-960h"
-    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
+    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+        "facebook/wav2vec2-base-960h"
+    )
     config = Wav2Vec2Config.from_pretrained(
-        model_name,
+        "facebook/wav2vec2-base-960h",
         num_labels=num_labels,
         hidden_dropout_prob=args.hidden_dropout_prob,
         attention_probs_dropout_prob=args.attention_probs_dropout_prob
@@ -136,6 +135,9 @@ def preprocess(batch):
             audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
             audio_array, _ = librosa.effects.trim(audio_array)
             audio_array = librosa.util.normalize(audio_array)
+            sr = 16000
+        # Always ensure 1D waveform for all backbones
+        audio_array = np.asarray(audio_array).flatten().astype(np.float32)
         inputs = feature_extractor(
             audio_array,
             sampling_rate=sr,
@@ -207,7 +209,7 @@ elif args.data_mode == 'augmented':
 # Model selection
 if args.loss == 'old':
     model = ModelClass.from_pretrained(
-        model_name,
+        feature_extractor.name_or_path,
         config=config,
         ignore_mismatched_sizes=True,
     )
@@ -230,39 +232,13 @@ else:
                     attentions=outputs.attentions if hasattr(outputs, "attentions") else None,
                 )
         model = OrdinalASTClassifier.from_pretrained(
-            model_name,
+            feature_extractor.name_or_path,
             config=config,
             ignore_mismatched_sizes=True,
         )
-    elif args.backbone == 'beats':
-        class OrdinalBEATSClassifier(BEATSForAudioClassification):
-            def forward(self, input_values=None, labels=None, **kwargs):
-                outputs = super().forward(input_values=input_values, labels=None, **kwargs)
-                logits = outputs.logits
-                loss = soft_cross_entropy_with_distance(logits, labels, distance_matrix) if labels is not None else None
-                from transformers.modeling_outputs import SequenceClassifierOutput
-                return SequenceClassifierOutput(loss=loss, logits=logits)
-        model = OrdinalBEATSClassifier.from_pretrained(
-            model_name,
-            config=config,
-            ignore_mismatched_sizes=True
-        )
-    elif args.backbone == 'wav2vec2':
-        class OrdinalWav2Vec2Classifier(Wav2Vec2ForSequenceClassification):
-            def forward(self, input_values=None, labels=None, **kwargs):
-                outputs = super().forward(input_values=input_values, labels=None, **kwargs)
-                logits = outputs.logits
-                loss = soft_cross_entropy_with_distance(logits, labels, distance_matrix) if labels is not None else None
-                from transformers.modeling_outputs import SequenceClassifierOutput
-                return SequenceClassifierOutput(loss=loss, logits=logits)
-        model = OrdinalWav2Vec2Classifier.from_pretrained(
-            model_name,
-            config=config,
-            ignore_mismatched_sizes=True
-        )
     else:
         model = ModelClass.from_pretrained(
-            model_name,
+            feature_extractor.name_or_path,
             config=config,
             ignore_mismatched_sizes=True,
         )
@@ -270,9 +246,9 @@ else:
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
-# Move class_positions tensors to device
-class_positions_order_aware = torch.tensor([1.0, 4.0, 3.0, 2.0, 0.0], dtype=torch.float32).to(device)
-class_positions_order_agnostic = torch.tensor([4.0, 3.0, 2.0, 1.0, 0.0], dtype=torch.float32).to(device)
+# Move class_positions tensors to device (not used for sex, but kept for compatibility)
+class_positions_order_aware = torch.tensor([0.0, 1.0], dtype=torch.float32).to(device)
+class_positions_order_agnostic = torch.tensor([1.0, 0.0], dtype=torch.float32).to(device)
 
 training_args = TrainingArguments(
     output_dir="./results",
@@ -289,7 +265,7 @@ training_args = TrainingArguments(
     max_steps=20 if args.test_20 else -1
 )
 
-def mean_squared_error_age_distance(preds, labels):
+def mean_squared_error_sex_distance(preds, labels):
     mse_arr = []
     labels_np = labels.cpu().numpy() if hasattr(labels, 'cpu') else np.array(labels)
     for class_positions in [class_positions_order_aware, class_positions_order_agnostic]:
@@ -305,7 +281,7 @@ def compute_metrics(eval_pred):
     preds = np.argmax(logits, axis=1)
     acc = accuracy_score(labels, preds)
     f1 = f1_score(labels, preds, average='weighted')
-    mse = mean_squared_error_age_distance(logits, labels)
+    mse = mean_squared_error_sex_distance(logits, labels)
     return {"accuracy": acc, "f1": f1, "mse_order_aware": mse[0], "mse_order_agnostic": mse[1]}
 
 trainer = Trainer(
