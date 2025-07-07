@@ -9,6 +9,7 @@ import argparse
 import pandas as pd
 from datasets import Dataset, Features, Sequence, Value
 import json
+from transformers import EarlyStoppingCallback
 
 # Age order and distance matrix
 age_order = {4: 0, 3: 1, 0: 2, 2: 3, 1: 4}
@@ -29,18 +30,18 @@ def soft_cross_entropy_with_distance(logits, true_labels, distance_matrix, tempe
     loss = torch.sum(-soft_targets * log_probs, dim=1)  # [B]
     return torch.mean(loss)
 
-# {'learning_rate': 1.5e-05, 'weight_decay': 0.02, 'hidden_dropout_prob': 0.3, 'attention_probs_dropout_prob': 0.3, 'data_mode': 'original'}
+# {'learning_rate': 2.5e-05, 'weight_decay': 0.01, 'hidden_dropout_prob': 0.35, 'attention_probs_dropout_prob': 0.35, 'clean_audio': '', 'loss': 'soft_cross', 'num_train_epochs': 6}
 parser = argparse.ArgumentParser()
-parser.add_argument('--learning_rate', type=float, default=1.5e-05)
-parser.add_argument('--weight_decay', type=float, default=0.02)
-parser.add_argument('--hidden_dropout_prob', type=float, default=0.3)
-parser.add_argument('--attention_probs_dropout_prob', type=float, default=0.3)
-parser.add_argument('--num_train_epochs', type=int, default=3)
+parser.add_argument('--learning_rate', type=float, default=2.5e-05)
+parser.add_argument('--weight_decay', type=float, default=0.01)
+parser.add_argument('--hidden_dropout_prob', type=float, default=0.35)
+parser.add_argument('--attention_probs_dropout_prob', type=float, default=0.35)
+parser.add_argument('--num_train_epochs', type=int, default=6)
 parser.add_argument('--data_mode', choices=['original', 'augmented'], default='original', help='Which training data to use')
 parser.add_argument('--metrics_out', type=str, default=None, help='If set, write final metrics to this file')
 parser.add_argument('--gpu_num', type=int, default=0, help='GPU number to use (default: 0)')
 parser.add_argument('--test_20', action='store_true', help='Run with just 20 steps for debugging')
-parser.add_argument('--loss', choices=['old','soft_cross'], default='old')
+parser.add_argument('--loss', choices=['old','soft_cross'], default='soft_cross')
 parser.add_argument('--clean_audio', action='store_true', help='If set, clean audio with librosa in preprocess')
 parser.add_argument('--backbone', choices=['ast', 'beats', 'wav2vec2'], default='ast', help='Model backbone: ast, beats, or wav2vec2')
 args = parser.parse_args()
@@ -277,7 +278,10 @@ class_positions_order_agnostic = torch.tensor([4.0, 3.0, 2.0, 1.0, 0.0], dtype=t
 training_args = TrainingArguments(
     output_dir="./results",
     eval_strategy="epoch",
-    save_strategy="no",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_accuracy",
+    greater_is_better=True,
     learning_rate=args.learning_rate,
     per_device_train_batch_size=32,
     per_device_eval_batch_size=32,
@@ -314,17 +318,22 @@ trainer = Trainer(
     train_dataset=train_ds,
     eval_dataset=test_ds,
     compute_metrics=compute_metrics,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
 )
 
 trainer.train()
 
-if not args.metrics_out:
-    # Save the fine-tuned model and feature extractor
-    save_dir = "./barkopedia_finetuned_model"
-    print(f"Saving model and feature extractor to {save_dir} ...")
-    model.save_pretrained(save_dir)
-    feature_extractor.save_pretrained(save_dir)
-    print("Model and feature extractor saved.")
+# Save the best model and feature extractor
+save_dir = "./barkopedia_finetuned_model"
+print(f"Saving best model and feature extractor to {save_dir} ...")
+trainer.save_model(save_dir)
+feature_extractor.save_pretrained(save_dir)
+print("Best model and feature extractor saved.")
+
+# Evaluate best model on test set and print best metrics
+print("Evaluating best model on test set...")
+best_metrics = trainer.evaluate(test_ds)
+print(f"Best epoch metrics: loss={best_metrics['eval_loss']}, accuracy={best_metrics['eval_accuracy']}, mse_order_aware={best_metrics.get('eval_mse_order_aware')}, mse_order_agnostic={best_metrics.get('eval_mse_order_agnostic')}")
 
 # Write final metrics to file if requested
 if args.metrics_out:
@@ -361,4 +370,5 @@ if args.metrics_out:
             'eval_acc': eval_acc,
             'train_f1': train_f1,
             'eval_f1': eval_f1,
+            'log_history': [entry for entry in trainer.state.log_history if 'eval_accuracy' in entry or 'eval_loss' in entry],
         }, f)
