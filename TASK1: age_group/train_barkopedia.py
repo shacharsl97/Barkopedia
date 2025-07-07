@@ -9,6 +9,7 @@ import argparse
 import pandas as pd
 from datasets import Dataset, Features, Sequence, Value
 import json
+from transformers import EarlyStoppingCallback
 
 # Age order and distance matrix
 age_order = {4: 0, 3: 1, 0: 2, 2: 3, 1: 4}
@@ -29,18 +30,18 @@ def soft_cross_entropy_with_distance(logits, true_labels, distance_matrix, tempe
     loss = torch.sum(-soft_targets * log_probs, dim=1)  # [B]
     return torch.mean(loss)
 
-# {'learning_rate': 1.5e-05, 'weight_decay': 0.02, 'hidden_dropout_prob': 0.3, 'attention_probs_dropout_prob': 0.3, 'data_mode': 'original'}
+# {'learning_rate': 2.5e-05, 'weight_decay': 0.01, 'hidden_dropout_prob': 0.35, 'attention_probs_dropout_prob': 0.35, 'clean_audio': '', 'loss': 'soft_cross', 'num_train_epochs': 6}
 parser = argparse.ArgumentParser()
-parser.add_argument('--learning_rate', type=float, default=1.5e-05)
-parser.add_argument('--weight_decay', type=float, default=0.02)
-parser.add_argument('--hidden_dropout_prob', type=float, default=0.3)
-parser.add_argument('--attention_probs_dropout_prob', type=float, default=0.3)
+parser.add_argument('--learning_rate', type=float, default=2.5e-05)
+parser.add_argument('--weight_decay', type=float, default=0.01)
+parser.add_argument('--hidden_dropout_prob', type=float, default=0.35)
+parser.add_argument('--attention_probs_dropout_prob', type=float, default=0.35)
 parser.add_argument('--num_train_epochs', type=int, default=3)
 parser.add_argument('--data_mode', choices=['original', 'augmented'], default='original', help='Which training data to use')
 parser.add_argument('--metrics_out', type=str, default=None, help='If set, write final metrics to this file')
 parser.add_argument('--gpu_num', type=int, default=0, help='GPU number to use (default: 0)')
 parser.add_argument('--test_20', action='store_true', help='Run with just 20 steps for debugging')
-parser.add_argument('--loss', choices=['old','soft_cross'], default='old')
+parser.add_argument('--loss', choices=['old','soft_cross'], default='soft_cross')
 parser.add_argument('--clean_audio', action='store_true', help='If set, clean audio with librosa in preprocess')
 parser.add_argument('--backbone', choices=['ast', 'beats', 'wav2vec2'], default='ast', help='Model backbone: ast, beats, or wav2vec2')
 args = parser.parse_args()
@@ -61,12 +62,19 @@ else:
 # Load dataset
 local_dir = "./barkopedia_dataset"
 print("Loading dataset from Hugging Face Hub...")
-ds = load_dataset(
-    "ArlingtonCL2/Barkopedia_DOG_AGE_GROUP_CLASSIFICATION_DATASET",
-    token=HF_TOKEN,
-    cache_dir=local_dir,
-)
-print("Dataset loaded successfully.")
+if local_dir and os.path.exists(local_dir):
+    print(f"Using local cache directory: {local_dir}")
+    ds = load_dataset(        "ArlingtonCL2/Barkopedia_DOG_AGE_GROUP_CLASSIFICATION_DATASET",
+        token=HF_TOKEN,
+        cache_dir=local_dir,
+    )
+else:
+    ds = load_dataset(
+        "ArlingtonCL2/Barkopedia_DOG_AGE_GROUP_CLASSIFICATION_DATASET",
+        token=HF_TOKEN,
+        cache_dir=local_dir,
+    )
+    print("Dataset loaded successfully.")
 
 # Use the first available split as train, second as test (customize as needed)
 splits = list(ds.keys())
@@ -74,6 +82,7 @@ train_ds = ds[splits[0]]
 test_ds = ds[splits[1]]
 print(f"Initial train_ds: {len(train_ds)} samples")
 print(f"Initial test_ds: {len(test_ds)} samples")
+
 # print available splits and their sizes
 print("Available splits:", ds.keys())
 for split in ds.keys():
@@ -127,6 +136,8 @@ elif args.backbone == 'wav2vec2':
 else:
     raise ValueError(f"Unknown backbone: {args.backbone}")
 
+MAX_AUDIO_LEN = 50000  # ~3.1 seconds at 16kHz
+
 def preprocess(batch):
     if "audio" in batch and isinstance(batch["audio"], dict) and "array" in batch["audio"]:
         audio_array = batch["audio"]["array"]
@@ -136,6 +147,11 @@ def preprocess(batch):
             audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
             audio_array, _ = librosa.effects.trim(audio_array)
             audio_array = librosa.util.normalize(audio_array)
+            sr = 16000
+
+        if len(audio_array) > MAX_AUDIO_LEN and args.backbone == 'wav2vec2':
+            audio_array = audio_array[:MAX_AUDIO_LEN]
+
         inputs = feature_extractor(
             audio_array,
             sampling_rate=sr,
@@ -145,13 +161,10 @@ def preprocess(batch):
     batch["labels"] = batch["label"]
     return batch
 
+
 # Preprocessing cache paths (separate for original and augmented)
-if args.data_mode == 'original':
-    train_cache = "./train_preprocessed"
-    test_cache = "./test_preprocessed"
-else:
-    train_cache = "./train_preprocessed_aug"
-    test_cache = "./test_preprocessed_aug"
+train_cache = f"./train_preprocessed_{args.backbone}"
+test_cache = f"./test_preprocessed_{args.backbone}"
 
 if args.data_mode == 'original':
     if os.path.exists(train_cache) and os.path.exists(test_cache):
@@ -250,6 +263,8 @@ else:
     elif args.backbone == 'wav2vec2':
         class OrdinalWav2Vec2Classifier(Wav2Vec2ForSequenceClassification):
             def forward(self, input_values=None, labels=None, **kwargs):
+                print(input_values.shape)  # should be [batch_size, sequence_length]
+                kwargs.pop('num_items_in_batch', None)
                 outputs = super().forward(input_values=input_values, labels=None, **kwargs)
                 logits = outputs.logits
                 loss = soft_cross_entropy_with_distance(logits, labels, distance_matrix) if labels is not None else None
@@ -277,7 +292,10 @@ class_positions_order_agnostic = torch.tensor([4.0, 3.0, 2.0, 1.0, 0.0], dtype=t
 training_args = TrainingArguments(
     output_dir="./results",
     eval_strategy="epoch",
-    save_strategy="no",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_accuracy",
+    greater_is_better=True,
     learning_rate=args.learning_rate,
     per_device_train_batch_size=32,
     per_device_eval_batch_size=32,
@@ -308,23 +326,55 @@ def compute_metrics(eval_pred):
     mse = mean_squared_error_age_distance(logits, labels)
     return {"accuracy": acc, "f1": f1, "mse_order_aware": mse[0], "mse_order_agnostic": mse[1]}
 
+from torch.nn.utils.rnn import pad_sequence
+
+class Wav2AudioCollator:
+    def __init__(self, padding_value=0.0):
+        self.padding_value = padding_value
+
+    def __call__(self, features):
+        input_values = [torch.tensor(f["input_values"]) for f in features]
+        labels = torch.tensor([f["labels"] for f in features])
+
+        # Pad input_values to the max length in batch
+        padded_inputs = pad_sequence(input_values, batch_first=True, padding_value=self.padding_value)
+
+        return {
+            "input_values": padded_inputs,
+            "labels": labels
+        }
+
+
+if args.backbone == 'wav2vec2':
+    data_collator = Wav2AudioCollator()
+else:
+    data_collator = None
+
+
+
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_ds,
     eval_dataset=test_ds,
+    data_collator=data_collator,
     compute_metrics=compute_metrics,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
 )
 
 trainer.train()
 
-if not args.metrics_out:
-    # Save the fine-tuned model and feature extractor
-    save_dir = "./barkopedia_finetuned_model"
-    print(f"Saving model and feature extractor to {save_dir} ...")
-    model.save_pretrained(save_dir)
-    feature_extractor.save_pretrained(save_dir)
-    print("Model and feature extractor saved.")
+# Save the best model and feature extractor
+save_dir = "./barkopedia_finetuned_model"
+print(f"Saving best model and feature extractor to {save_dir} ...")
+trainer.save_model(save_dir)
+feature_extractor.save_pretrained(save_dir)
+print("Best model and feature extractor saved.")
+
+# Evaluate best model on test set and print best metrics
+print("Evaluating best model on test set...")
+best_metrics = trainer.evaluate(test_ds)
+print(f"Best epoch metrics: loss={best_metrics['eval_loss']}, accuracy={best_metrics['eval_accuracy']}, mse_order_aware={best_metrics.get('eval_mse_order_aware')}, mse_order_agnostic={best_metrics.get('eval_mse_order_agnostic')}")
 
 # Write final metrics to file if requested
 if args.metrics_out:
@@ -361,4 +411,5 @@ if args.metrics_out:
             'eval_acc': eval_acc,
             'train_f1': train_f1,
             'eval_f1': eval_f1,
+            'log_history': [entry for entry in trainer.state.log_history if 'eval_accuracy' in entry or 'eval_loss' in entry],
         }, f)
