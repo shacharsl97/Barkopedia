@@ -23,7 +23,7 @@ class SimpleBarkopediaGenderDataset(SimpleBarkopediaDataset):
     def __init__(self, config: SimpleDatasetConfig, split: str = "train"):
         super().__init__(config, split)
         
-        # Gender mapping
+        # Gender mapping (initially - will be updated based on actual data)
         self.id_to_label = {
             0: "female",
             1: "male"
@@ -65,32 +65,123 @@ class SimpleBarkopediaGenderDataset(SimpleBarkopediaDataset):
             
             print(f"Processing {len(raw_data)} samples...")
             
-            # Process each sample
+            # Cast audio column to disable automatic decoding - this prevents corruption errors
+            from datasets import Audio
+            raw_data = raw_data.cast_column("audio", Audio(decode=False))
+            
+            # Process each sample with robust error handling
             self.data = []
             self.labels = []
+            unique_labels = set()
+            processed_count = 0
+            skipped_count = 0
             
-            for i, sample in enumerate(raw_data):
-                processed_sample = self._process_sample(sample)
-                self.data.append(processed_sample)
-                self.labels.append(processed_sample['labels'])
-                
-                if (i + 1) % 100 == 0:
-                    print(f"Processed {i + 1}/{len(raw_data)} samples")
+            for i in range(len(raw_data)):
+                try:
+                    # Get sample - audio will now be a path/bytes, not pre-decoded
+                    sample_dict = raw_data[i]
+                    
+                    # Try to process the sample
+                    processed_sample = self._process_sample(sample_dict)
+                    self.data.append(processed_sample)
+                    self.labels.append(processed_sample['labels'])
+                    unique_labels.add(processed_sample['labels'])
+                    processed_count += 1
+                    
+                    if processed_count % 100 == 0:
+                        print(f"Processed {processed_count} valid samples (skipped: {skipped_count})...")
+                        
+                except Exception as e:
+                    # Skip corrupted samples
+                    skipped_count += 1
+                    if skipped_count <= 10:  # Only print first 10 errors to avoid spam
+                        print(f"Skipping corrupted sample {i+1}: {str(e)[:100]}...")
+                    elif skipped_count == 11:
+                        print("... (suppressing further error messages)")
+                    continue
             
-            print(f"Loaded {len(self.data)} samples for {self.split} split")
+            # Update label mapping based on discovered labels
+            unique_labels = sorted(list(unique_labels))
+            print(f"Found unique labels: {unique_labels}")
+            
+            if len(unique_labels) == 2:
+                # Binary classification - assume 0=female, 1=male
+                self.id_to_label = {
+                    unique_labels[0]: "female", 
+                    unique_labels[1]: "male"
+                }
+            else:
+                # Multiple labels - create generic mapping
+                self.id_to_label = {label: f"class_{label}" for label in unique_labels}
+            
+            self.label_to_id = {v: k for k, v in self.id_to_label.items()}
+            print(f"Updated label mapping: {self.id_to_label}")
+            
+            print(f"Loaded {len(self.data)} samples for {self.split} split (skipped: {skipped_count})")
             print(f"Label distribution: {self.get_class_distribution()}")
+            
+            if len(self.data) == 0:
+                raise RuntimeError("No valid samples found in dataset after filtering corrupted files")
             
         except Exception as e:
             raise RuntimeError(f"Failed to load dataset: {e}")
     
     def _process_sample(self, sample: Any) -> Dict[str, Any]:
         """Process a single sample into the format expected by models."""
-        # Extract audio data
-        if isinstance(sample["audio"], dict):
-            audio = sample["audio"]["array"]
-            sampling_rate = sample["audio"]["sampling_rate"]
+        # Extract audio data - now audio is not pre-decoded due to decode=False
+        audio_info = sample["audio"]
+        
+        if isinstance(audio_info, dict):
+            if "array" in audio_info and audio_info["array"] is not None:
+                # Audio is already loaded (shouldn't happen with decode=False, but handle it)
+                audio = audio_info["array"]
+                sampling_rate = audio_info["sampling_rate"]
+            elif "path" in audio_info:
+                # Audio needs to be loaded from path
+                audio_path = audio_info["path"]
+                try:
+                    import soundfile as sf
+                    audio, sampling_rate = sf.read(audio_path)
+                except Exception as e:
+                    raise ValueError(f"Could not load audio from {audio_path}: {e}")
+            elif "bytes" in audio_info:
+                # Audio is in bytes format
+                try:
+                    import soundfile as sf
+                    import io
+                    audio, sampling_rate = sf.read(io.BytesIO(audio_info["bytes"]))
+                except Exception as e:
+                    raise ValueError(f"Could not load audio from bytes: {e}")
+            else:
+                raise ValueError(f"Unknown audio format in sample: {list(audio_info.keys())}")
         else:
-            raise ValueError("Unexpected audio format in sample")
+            # Direct path or bytes
+            try:
+                import soundfile as sf
+                if isinstance(audio_info, str):
+                    # It's a path
+                    audio, sampling_rate = sf.read(audio_info)
+                else:
+                    # It's bytes
+                    import io
+                    audio, sampling_rate = sf.read(io.BytesIO(audio_info))
+            except Exception as e:
+                raise ValueError(f"Could not load audio: {e}")
+        
+        # Convert to numpy array if needed
+        if not isinstance(audio, np.ndarray):
+            audio = np.array(audio)
+        
+        # Ensure correct data type (float32 for PyTorch compatibility)
+        audio = audio.astype(np.float32)
+        
+        # Convert stereo to mono if needed
+        if len(audio.shape) > 1 and audio.shape[1] > 1:
+            audio = np.mean(audio, axis=1)  # Average the channels
+        
+        # Ensure audio is 1D
+        if len(audio.shape) > 1:
+            audio = audio.flatten()
         
         # Resample if needed
         if sampling_rate != self.config.sampling_rate:
@@ -99,24 +190,21 @@ class SimpleBarkopediaGenderDataset(SimpleBarkopediaDataset):
         # Apply cleaning if enabled
         audio = self.clean_audio(audio, self.config.sampling_rate)
         
-        # Extract features using AST feature extractor
-        inputs = self.feature_extractor(
-            audio, 
-            sampling_rate=self.config.sampling_rate, 
-            return_tensors="pt"
-        )
-        input_values = inputs.input_values.squeeze(0)  # Remove batch dimension
+        # Final ensure float32 type after all processing
+        audio = audio.astype(np.float32)
+        
+        # IMPORTANT: Return raw audio, not pre-processed features
+        # The model will handle feature extraction during training
         
         # Get label information
         label_id = sample["label"]
-        label_name = self.id_to_label[label_id]
+        label_name = self.id_to_label.get(label_id, f"unknown_{label_id}")
         
         return {
-            "input_values": input_values,
+            "audio": audio,  # Raw audio array
             "labels": label_id,
             "label_name": label_name,
-            "sampling_rate": self.config.sampling_rate,
-            "audio": audio  # Keep original audio if needed
+            "sampling_rate": self.config.sampling_rate
         }
 
 
