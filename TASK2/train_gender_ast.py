@@ -149,31 +149,49 @@ def create_datasets(args, hf_token):
         raise
 
 
-def create_model(args, device):
+def create_model(args, device, num_labels):
     """Create and initialize the AST classification model."""
     logger.info("Creating AST classification model...")
     
-    # Gender classification has 2 classes: female (0), male (1)
-    model = ASTClassificationModel(num_labels=2, device=device)
+    # Create model with the correct number of labels
+    model = ASTClassificationModel(num_labels=num_labels, device=device)
     
     # Load the backbone
     backbone_args = {"model_name": args.model_name}
     model.load_backbone(backbone_args)
     
     logger.info(f"Model created with backbone: {args.model_name}")
-    logger.info(f"Number of labels: 2 (female, male)")
+    logger.info(f"Number of labels: {num_labels}")
     
     return model
 
 
 def custom_collate_fn(batch):
     """Custom collate function to handle batching."""
-    input_values = torch.stack([item['input_values'] for item in batch])
-    labels = torch.tensor([item['labels'] for item in batch], dtype=torch.long)
+    # Extract audio arrays and labels from batch
+    audio_arrays = []
+    labels = []
+    sampling_rates = []
+    
+    for item in batch:
+        audio = item['audio']
+        # Ensure audio is float32 numpy array
+        if not isinstance(audio, np.ndarray):
+            audio = np.array(audio, dtype=np.float32)
+        else:
+            audio = audio.astype(np.float32)
+        
+        audio_arrays.append(audio)
+        labels.append(item['labels'])
+        sampling_rates.append(item['sampling_rate'])
+    
+    # Ensure all audio has the same sampling rate
+    assert all(sr == sampling_rates[0] for sr in sampling_rates), "All audio must have the same sampling rate"
     
     return {
-        'input_values': input_values,
-        'labels': labels
+        'audio': audio_arrays,  # List of float32 numpy arrays
+        'labels': torch.tensor(labels, dtype=torch.long),
+        'sampling_rate': sampling_rates[0]
     }
 
 
@@ -189,12 +207,25 @@ def evaluate_model(model, dataloader, device, label_names, sampling_rate=16000):
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            input_values = batch['input_values'].to(device)
+            audio_arrays = batch['audio']  # List of numpy arrays
             labels = batch['labels'].to(device)
+            sampling_rate = batch['sampling_rate']
             
-            # Forward pass
-            logits = model.forward(input_values.cpu().numpy(), sampling_rate)
-            logits = logits.to(device)
+            # Forward pass - process each audio array in the batch
+            batch_logits = []
+            for audio in audio_arrays:
+                # Ensure audio is 1D, mono, and float32
+                if len(audio.shape) > 1:
+                    audio = audio.flatten()
+                
+                # Ensure float32 data type
+                audio = audio.astype(np.float32)
+                
+                logits = model.forward(audio, sampling_rate)
+                batch_logits.append(logits)
+            
+            # Stack logits from all samples in the batch
+            logits = torch.cat(batch_logits, dim=0).to(device)
             
             # Calculate loss
             loss = criterion(logits, labels)
@@ -257,7 +288,7 @@ def train_model(model, train_dataset, test_dataset, args, device):
     train_losses = []
     eval_results = []
     best_f1 = 0.0
-    label_names = ['female', 'male']
+    label_names = list(train_dataset.id_to_label.values())
     
     # Create save directory
     os.makedirs(args.save_dir, exist_ok=True)
@@ -275,15 +306,28 @@ def train_model(model, train_dataset, test_dataset, args, device):
         progress_bar = tqdm(train_loader, desc=f"Training Epoch {epoch + 1}")
         
         for step, batch in enumerate(progress_bar):
-            input_values = batch['input_values'].to(device)
+            audio_arrays = batch['audio']  # List of numpy arrays
             labels = batch['labels'].to(device)
+            sampling_rate = batch['sampling_rate']
             
             # Zero gradients
             optimizer.zero_grad()
             
-            # Forward pass
-            logits = model.forward(input_values.cpu().numpy(), args.sampling_rate)
-            logits = logits.to(device)
+            # Forward pass - process each audio array in the batch
+            batch_logits = []
+            for audio in audio_arrays:
+                # Ensure audio is 1D, mono, and float32
+                if len(audio.shape) > 1:
+                    audio = audio.flatten()
+                
+                # Ensure float32 data type
+                audio = audio.astype(np.float32)
+                
+                logits = model.forward(audio, sampling_rate)
+                batch_logits.append(logits)
+            
+            # Stack logits from all samples in the batch
+            logits = torch.cat(batch_logits, dim=0).to(device)
             
             # Calculate loss
             loss = criterion(logits, labels)
@@ -414,7 +458,8 @@ def main():
         train_dataset, test_dataset = create_datasets(args, args.hf_token)
         
         # Create model
-        model = create_model(args, device)
+        num_labels = len(train_dataset.id_to_label)
+        model = create_model(args, device, num_labels)
         
         # Train model
         trained_model, final_results = train_model(model, train_dataset, test_dataset, args, device)
