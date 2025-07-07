@@ -36,7 +36,7 @@ parser.add_argument('--learning_rate', type=float, default=2.5e-05)
 parser.add_argument('--weight_decay', type=float, default=0.01)
 parser.add_argument('--hidden_dropout_prob', type=float, default=0.35)
 parser.add_argument('--attention_probs_dropout_prob', type=float, default=0.35)
-parser.add_argument('--num_train_epochs', type=int, default=6)
+parser.add_argument('--num_train_epochs', type=int, default=3)
 parser.add_argument('--data_mode', choices=['original', 'augmented'], default='original', help='Which training data to use')
 parser.add_argument('--metrics_out', type=str, default=None, help='If set, write final metrics to this file')
 parser.add_argument('--gpu_num', type=int, default=0, help='GPU number to use (default: 0)')
@@ -62,12 +62,19 @@ else:
 # Load dataset
 local_dir = "./barkopedia_dataset"
 print("Loading dataset from Hugging Face Hub...")
-ds = load_dataset(
-    "ArlingtonCL2/Barkopedia_DOG_AGE_GROUP_CLASSIFICATION_DATASET",
-    token=HF_TOKEN,
-    cache_dir=local_dir,
-)
-print("Dataset loaded successfully.")
+if local_dir and os.path.exists(local_dir):
+    print(f"Using local cache directory: {local_dir}")
+    ds = load_dataset(        "ArlingtonCL2/Barkopedia_DOG_AGE_GROUP_CLASSIFICATION_DATASET",
+        token=HF_TOKEN,
+        cache_dir=local_dir,
+    )
+else:
+    ds = load_dataset(
+        "ArlingtonCL2/Barkopedia_DOG_AGE_GROUP_CLASSIFICATION_DATASET",
+        token=HF_TOKEN,
+        cache_dir=local_dir,
+    )
+    print("Dataset loaded successfully.")
 
 # Use the first available split as train, second as test (customize as needed)
 splits = list(ds.keys())
@@ -75,6 +82,7 @@ train_ds = ds[splits[0]]
 test_ds = ds[splits[1]]
 print(f"Initial train_ds: {len(train_ds)} samples")
 print(f"Initial test_ds: {len(test_ds)} samples")
+
 # print available splits and their sizes
 print("Available splits:", ds.keys())
 for split in ds.keys():
@@ -128,6 +136,8 @@ elif args.backbone == 'wav2vec2':
 else:
     raise ValueError(f"Unknown backbone: {args.backbone}")
 
+MAX_AUDIO_LEN = 50000  # ~3.1 seconds at 16kHz
+
 def preprocess(batch):
     if "audio" in batch and isinstance(batch["audio"], dict) and "array" in batch["audio"]:
         audio_array = batch["audio"]["array"]
@@ -137,6 +147,11 @@ def preprocess(batch):
             audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
             audio_array, _ = librosa.effects.trim(audio_array)
             audio_array = librosa.util.normalize(audio_array)
+            sr = 16000
+
+        if len(audio_array) > MAX_AUDIO_LEN and args.backbone == 'wav2vec2':
+            audio_array = audio_array[:MAX_AUDIO_LEN]
+
         inputs = feature_extractor(
             audio_array,
             sampling_rate=sr,
@@ -146,13 +161,10 @@ def preprocess(batch):
     batch["labels"] = batch["label"]
     return batch
 
+
 # Preprocessing cache paths (separate for original and augmented)
-if args.data_mode == 'original':
-    train_cache = "./train_preprocessed"
-    test_cache = "./test_preprocessed"
-else:
-    train_cache = "./train_preprocessed_aug"
-    test_cache = "./test_preprocessed_aug"
+train_cache = f"./train_preprocessed_{args.backbone}"
+test_cache = f"./test_preprocessed_{args.backbone}"
 
 if args.data_mode == 'original':
     if os.path.exists(train_cache) and os.path.exists(test_cache):
@@ -251,6 +263,8 @@ else:
     elif args.backbone == 'wav2vec2':
         class OrdinalWav2Vec2Classifier(Wav2Vec2ForSequenceClassification):
             def forward(self, input_values=None, labels=None, **kwargs):
+                print(input_values.shape)  # should be [batch_size, sequence_length]
+                kwargs.pop('num_items_in_batch', None)
                 outputs = super().forward(input_values=input_values, labels=None, **kwargs)
                 logits = outputs.logits
                 loss = soft_cross_entropy_with_distance(logits, labels, distance_matrix) if labels is not None else None
@@ -312,11 +326,38 @@ def compute_metrics(eval_pred):
     mse = mean_squared_error_age_distance(logits, labels)
     return {"accuracy": acc, "f1": f1, "mse_order_aware": mse[0], "mse_order_agnostic": mse[1]}
 
+from torch.nn.utils.rnn import pad_sequence
+
+class Wav2AudioCollator:
+    def __init__(self, padding_value=0.0):
+        self.padding_value = padding_value
+
+    def __call__(self, features):
+        input_values = [torch.tensor(f["input_values"]) for f in features]
+        labels = torch.tensor([f["labels"] for f in features])
+
+        # Pad input_values to the max length in batch
+        padded_inputs = pad_sequence(input_values, batch_first=True, padding_value=self.padding_value)
+
+        return {
+            "input_values": padded_inputs,
+            "labels": labels
+        }
+
+
+if args.backbone == 'wav2vec2':
+    data_collator = Wav2AudioCollator()
+else:
+    data_collator = None
+
+
+
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_ds,
     eval_dataset=test_ds,
+    data_collator=data_collator,
     compute_metrics=compute_metrics,
     callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
 )
