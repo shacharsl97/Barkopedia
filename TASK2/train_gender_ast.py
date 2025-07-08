@@ -75,6 +75,16 @@ def parse_arguments():
     parser.add_argument('--debug', action='store_true',
                        help='Run in debug mode with limited data')
     
+    # Segmentation arguments
+    parser.add_argument('--enable_segmentation', action='store_true',
+                       help='Enable automatic audio segmentation into chunks')
+    parser.add_argument('--segment_duration', type=float, default=2.0,
+                       help='Target duration for each segment (0.3-5.0 seconds)')
+    parser.add_argument('--segment_overlap', type=float, default=0.1,
+                       help='Overlap between segments in seconds')
+    parser.add_argument('--energy_threshold', type=float, default=0.01,
+                       help='Energy threshold for silence detection (0.001-0.1)')
+    
     return parser.parse_args()
 
 
@@ -121,7 +131,11 @@ def create_datasets(args, hf_token):
             hf_token=hf_token,
             apply_cleaning=args.apply_cleaning,
             sampling_rate=args.sampling_rate,
-            max_duration=args.max_duration
+            max_duration=args.max_duration,
+            enable_segmentation=args.enable_segmentation,
+            segment_duration=args.segment_duration,
+            segment_overlap=args.segment_overlap,
+            energy_threshold=args.energy_threshold
         )
         
         train_dataset = splits['train']
@@ -132,15 +146,54 @@ def create_datasets(args, hf_token):
         
         # Print class distribution
         train_dist = train_dataset.get_class_distribution()
+        test_dist = test_dataset.get_class_distribution()
         logger.info(f"Train class distribution: {train_dist}")
+        logger.info(f"Test class distribution: {test_dist}")
+        
+        # Print label mappings
+        logger.info(f"Train label mapping: {train_dataset.id_to_label}")
+        logger.info(f"Test label mapping: {test_dataset.id_to_label}")
         
         if args.debug:
-            # Limit dataset size for debugging
+            # Limit dataset size for debugging with balanced sampling
             train_dataset.data = train_dataset.data[:100]
             train_dataset.labels = train_dataset.labels[:100]
-            test_dataset.data = test_dataset.data[:50]
-            test_dataset.labels = test_dataset.labels[:50]
-            logger.info("Debug mode: Limited dataset size")
+            
+            # For test dataset, try to get balanced samples
+            test_labels = np.array(test_dataset.labels)
+            female_indices = np.where(test_labels == 0)[0]
+            male_indices = np.where(test_labels == 1)[0]
+            
+            # Take up to 25 of each class for balanced test set
+            selected_indices = []
+            if len(female_indices) > 0:
+                selected_indices.extend(female_indices[:25])
+            if len(male_indices) > 0:
+                selected_indices.extend(male_indices[:25])
+            
+            if len(selected_indices) > 0:
+                # Ensure we don't exceed dataset size
+                selected_indices = [i for i in selected_indices if i < len(test_dataset.data)]
+                test_dataset.data = [test_dataset.data[i] for i in selected_indices]
+                test_dataset.labels = [test_dataset.labels[i] for i in selected_indices]
+            else:
+                # Fallback to first 50
+                test_dataset.data = test_dataset.data[:50]
+                test_dataset.labels = test_dataset.labels[:50]
+            
+            logger.info(f"Debug mode: Limited dataset size - Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+            
+            # Print updated class distributions
+            logger.info(f"Debug train class distribution: {train_dataset.get_class_distribution()}")
+            logger.info(f"Debug test class distribution: {test_dataset.get_class_distribution()}")
+            
+            # Print sample info
+            if len(train_dataset) > 0:
+                sample = train_dataset[0]
+                logger.info(f"Train sample - Label: {sample['labels']}, Audio shape: {sample['audio'].shape}")
+            if len(test_dataset) > 0:
+                sample = test_dataset[0]
+                logger.info(f"Test sample - Label: {sample['labels']}, Audio shape: {sample['audio'].shape}")
         
         return train_dataset, test_dataset
         
@@ -221,6 +274,12 @@ def evaluate_model(model, dataloader, device, label_names, sampling_rate=16000):
                 # Ensure float32 data type
                 audio = audio.astype(np.float32)
                 
+                # Additional safety check for minimum length
+                min_length = 400  # AST requires at least 400 samples
+                if len(audio) < min_length:
+                    padding_needed = min_length - len(audio)
+                    audio = np.pad(audio, (0, padding_needed), mode='constant', constant_values=0)
+                
                 logits = model.forward(audio, sampling_rate)
                 batch_logits.append(logits)
             
@@ -241,9 +300,36 @@ def evaluate_model(model, dataloader, device, label_names, sampling_rate=16000):
     f1 = f1_score(all_labels, all_predictions, average='weighted')
     avg_loss = total_loss / len(dataloader)
     
-    # Detailed classification report
-    report = classification_report(all_labels, all_predictions, 
-                                 target_names=label_names, output_dict=True)
+    # Debug information
+    unique_labels = sorted(list(set(all_labels)))
+    unique_predictions = sorted(list(set(all_predictions)))
+    
+    logger.info(f"Evaluation - Unique true labels: {unique_labels}")
+    logger.info(f"Evaluation - Unique predictions: {unique_predictions}")
+    logger.info(f"Evaluation - Label distribution: {dict(zip(*np.unique(all_labels, return_counts=True)))}")
+    logger.info(f"Evaluation - Prediction distribution: {dict(zip(*np.unique(all_predictions, return_counts=True)))}")
+    
+    # Detailed classification report with proper error handling
+    try:
+        # Only include labels that appear in either true labels or predictions
+        labels_present = sorted(list(set(all_labels + all_predictions)))
+        target_names_present = [label_names[i] for i in labels_present if i < len(label_names)]
+        
+        report = classification_report(
+            all_labels, 
+            all_predictions, 
+            labels=labels_present,
+            target_names=target_names_present if len(target_names_present) == len(labels_present) else None,
+            output_dict=True,
+            zero_division=0
+        )
+    except Exception as e:
+        logger.warning(f"Could not generate detailed classification report: {e}")
+        report = {
+            'accuracy': accuracy,
+            'macro avg': {'precision': 0, 'recall': 0, 'f1-score': f1, 'support': len(all_labels)},
+            'weighted avg': {'precision': 0, 'recall': 0, 'f1-score': f1, 'support': len(all_labels)}
+        }
     
     return {
         'accuracy': accuracy,
@@ -322,6 +408,13 @@ def train_model(model, train_dataset, test_dataset, args, device):
                 
                 # Ensure float32 data type
                 audio = audio.astype(np.float32)
+                
+                # Additional safety check for minimum length
+                min_length = 400  # AST requires at least 400 samples
+                if len(audio) < min_length:
+                    padding_needed = min_length - len(audio)
+                    audio = np.pad(audio, (0, padding_needed), mode='constant', constant_values=0)
+                    logger.warning(f"Training: Audio too short, padded from {len(audio) - padding_needed} to {len(audio)} samples")
                 
                 logits = model.forward(audio, sampling_rate)
                 batch_logits.append(logits)

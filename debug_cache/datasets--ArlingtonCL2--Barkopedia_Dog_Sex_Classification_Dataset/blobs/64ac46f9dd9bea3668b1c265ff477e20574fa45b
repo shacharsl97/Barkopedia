@@ -1,0 +1,52 @@
+import os
+import shutil
+import time
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Use the correct folder names (train_0, train_1, train_2)
+source_folders = ["./train_splits/train_0", "./train_splits/train_1", "./train_splits/train_2"]
+dest_dir = os.path.join(script_dir, "train")
+
+os.makedirs(dest_dir, exist_ok=True)
+
+copied = skipped = errors = 0
+start = time.time()
+
+print(f"Script directory: {script_dir}")
+print(f"Destination folder: {dest_dir}")
+print("Starting copy process...\n")
+
+for relative in source_folders:
+    src_path = os.path.join(script_dir, relative)
+    base_name = os.path.basename(relative)
+
+    if not os.path.isdir(src_path):
+        print(f"Skipping missing folder: {src_path}")
+        continue
+
+    print(f"Processing folder: {src_path}")
+
+    for fname in os.listdir(src_path):
+        if not fname.lower().endswith(".wav"):
+            continue
+
+        src_file = os.path.join(src_path, fname)
+        dest_file = os.path.join(dest_dir, f"{fname}")
+
+        if os.path.exists(dest_file):
+            skipped += 1
+            continue
+
+        try:
+            shutil.copy2(src_file, dest_file)
+            copied += 1
+            if copied % 100 == 0:
+                print(f"Copied {copied} files so far...")
+        except Exception as e:
+            print(f"Failed to copy {src_file}: {e}")
+            errors += 1
+
+duration = time.time() - start
+print(f"\nCopied: {copied}, Skipped: {skipped}, Errors: {errors}")
+print(f"Time taken: {duration:.2f} seconds")

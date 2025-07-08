@@ -15,6 +15,14 @@ class SimpleDatasetConfig:
     apply_cleaning: bool = False
     max_duration: Optional[float] = None  # seconds
     min_duration: Optional[float] = None  # seconds
+    # Segmentation options
+    enable_segmentation: bool = False  # Enable automatic segmentation
+    segment_duration: float = 2.0  # Target segment duration in seconds (0.3-5.0)
+    segment_overlap: float = 0.1   # Overlap between segments in seconds
+    min_segment_duration: float = 0.3  # Minimum segment duration in seconds
+    max_segment_duration: float = 5.0  # Maximum segment duration in seconds
+    energy_threshold: float = 0.01  # Energy threshold for silence detection (0.001-0.1)
+    silence_min_duration: float = 0.1  # Minimum silence duration to split on (seconds)
 
 class SimpleBarkopediaDataset(Dataset, ABC):
     """
@@ -54,13 +62,20 @@ class SimpleBarkopediaDataset(Dataset, ABC):
         )
     
     def _collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        """Custom collate function for batching samples."""
-        # Stack tensors
-        if isinstance(batch[0]['input_values'], torch.Tensor):
-            input_values = torch.stack([item['input_values'] for item in batch])
-        else:
-            input_values = torch.tensor([item['input_values'] for item in batch])
-            
+        """Custom collate function for batching samples with padding."""
+        from torch.nn.utils.rnn import pad_sequence
+        
+        # Convert input_values to tensors and pad to same length
+        input_values_list = []
+        for item in batch:
+            if isinstance(item['input_values'], torch.Tensor):
+                input_values_list.append(item['input_values'])
+            else:
+                input_values_list.append(torch.tensor(item['input_values'], dtype=torch.float32))
+        
+        # Pad sequences to the same length
+        input_values = pad_sequence(input_values_list, batch_first=True, padding_value=0.0)
+        
         labels = torch.tensor([item['labels'] for item in batch], dtype=torch.long)
         
         return {
