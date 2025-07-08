@@ -4,6 +4,9 @@ from dataclasses import dataclass
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
+import pickle
+import hashlib
+import os
 
 @dataclass
 class SimpleDatasetConfig:
@@ -28,6 +31,7 @@ class SimpleBarkopediaDataset(Dataset, ABC):
     """
     Simplified base class for Barkopedia datasets.
     Just holds data and provides PyTorch Dataset interface.
+    Adds automatic caching based on dataset name, split, and config.
     """
     
     def __init__(self, config: SimpleDatasetConfig, split: str = "train"):
@@ -37,6 +41,41 @@ class SimpleBarkopediaDataset(Dataset, ABC):
         self.labels = []
         self.id_to_label = {}
         self.label_to_id = {}
+        # Caching
+        self.cache_dir = os.path.join(self.config.cache_dir, self.config.dataset_name)
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.cache_path = self._get_cache_path()
+        if os.path.exists(self.cache_path):
+            print(f"[Cache] Loading {self.split} from cache: {self.cache_path}")
+            self._load_from_cache()
+        else:
+            print(f"[Cache] No cache found for {self.split}. Preprocessing and caching to {self.cache_path} ...")
+            self.load_data()
+            self._save_to_cache()
+            print(f"[Cache] Finished preprocessing and cached {self.split} at {self.cache_path}")
+
+    def _get_cache_path(self):
+        # Hash config relevant fields for cache key
+        config_str = f"{self.config.dataset_name}_{self.split}_{self.config.sampling_rate}_{self.config.apply_cleaning}_{self.config.max_duration}_{self.config.min_duration}"
+        config_hash = hashlib.md5(config_str.encode()).hexdigest()
+        return os.path.join(self.cache_dir, f"{self.split}_{config_hash}.pkl")
+
+    def _save_to_cache(self):
+        with open(self.cache_path, 'wb') as f:
+            pickle.dump({
+                'data': self.data,
+                'labels': self.labels,
+                'id_to_label': self.id_to_label,
+                'label_to_id': self.label_to_id
+            }, f)
+
+    def _load_from_cache(self):
+        with open(self.cache_path, 'rb') as f:
+            obj = pickle.load(f)
+            self.data = obj['data']
+            self.labels = obj['labels']
+            self.id_to_label = obj['id_to_label']
+            self.label_to_id = obj['label_to_id']
     
     @abstractmethod
     def load_data(self) -> None:

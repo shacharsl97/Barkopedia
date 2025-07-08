@@ -7,6 +7,7 @@ from .barkopedia_gender_dataset import BarkopediaGenderDataset, create_barkopedi
 from .simple_dataset_interface import SimpleBarkopediaDataset, SimpleDatasetConfig
 from .simple_barkopedia_age_dataset import SimpleBarkopediaAgeDataset, create_simple_barkopedia_dataset
 from .simple_barkopedia_gender_dataset import SimpleBarkopediaGenderDataset, create_simple_barkopedia_gender_dataset
+from .simple_barkopedia_breed_dataset import SimpleBarkopediaBreedDataset, create_simple_barkopedia_breed_dataset
 
 __all__ = [
     'BarkopediaDataset', 
@@ -21,5 +22,7 @@ __all__ = [
     'SimpleBarkopediaAgeDataset', 
     'create_simple_barkopedia_dataset',
     'SimpleBarkopediaGenderDataset', 
-    'create_simple_barkopedia_gender_dataset'
+    'create_simple_barkopedia_gender_dataset',
+    'SimpleBarkopediaBreedDataset',
+    'create_simple_barkopedia_breed_dataset'
 ]
